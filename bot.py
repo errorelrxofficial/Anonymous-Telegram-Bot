@@ -1,208 +1,140 @@
-import random
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext, PicklePersistence, ConversationHandler
-from telegram.ext import ContextTypes
-from telegram.ext import CommandHandler, MessageHandler, filters, Application
-import pickle
+import os
+import time
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext, ConversationHandler
+from dotenv import load_dotenv
 
-# Constants for conversation states
-GENDER, LANGUAGE, MATCHING = range(3)
+# Load environment variables
+load_dotenv()
+TOKEN = os.getenv("BOT_TOKEN")  # Bot token from BotFather
+ADMIN_ID = int(os.getenv("ADMIN_ID"))  # Your Telegram User ID
 
-# Dictionary to hold user data in memory
-user_data = {}
+queue = {"male": [], "female": []}  # Stores users waiting for match
+active_chats = {}  # Stores ongoing chats
+banned_users = set()  # Stores banned users
+last_messages = {}  # Prevents spam
 
-# Banned users
-banned_users = set()
+GENDER, CHAT = range(2)  # Conversation states
 
-# Admin ID (replace with your admin Telegram user ID)
-ADMIN_ID = 123456789
-
-# Language settings
-LANGUAGES = {
-    'en': 'English',
-    'ru': 'Russian',
-    'id': 'Indonesian'
-}
-
-async def start(update: Update, context: CallbackContext) -> int:
-    user_id = update.message.from_user.id
-    
+def start(update: Update, context: CallbackContext):
+    user_id = update.message.chat_id
     if user_id in banned_users:
-        await update.message.reply_text("You are banned from using this bot.")
-        return ConversationHandler.END
+        update.message.reply_text("🚫 You are banned from using this bot.")
+        return
 
-    await update.message.reply_text(
-        "Welcome! Please select your gender.\n\n"
-        "1. Male\n"
-        "2. Female"
+    update.message.reply_text(
+        "👋 Welcome to Anonymous Chat!\nChoose your gender:",
+        reply_markup=ReplyKeyboardMarkup([["Male", "Female"]], one_time_keyboard=True)
     )
-    
     return GENDER
 
-async def gender(update: Update, context: CallbackContext) -> int:
-    user_id = update.message.from_user.id
-    
-    if user_id in banned_users:
-        await update.message.reply_text("You are banned from using this bot.")
-        return ConversationHandler.END
-
-    # Save the gender preference
+def select_gender(update: Update, context: CallbackContext):
+    user_id = update.message.chat_id
     gender = update.message.text.lower()
-    if gender == '1' or gender == 'male':
-        user_data[user_id] = {'gender': 'male'}
-    elif gender == '2' or gender == 'female':
-        user_data[user_id] = {'gender': 'female'}
-    else:
-        await update.message.reply_text("Invalid gender option. Please select '1' for Male or '2' for Female.")
+    if gender not in ["male", "female"]:
+        update.message.reply_text("❌ Invalid choice. Please select Male or Female.")
         return GENDER
 
-    await update.message.reply_text(
-        "Now, please select your language.\n\n"
-        "1. English\n"
-        "2. Russian\n"
-        "3. Indonesian"
-    )
-    
-    return LANGUAGE
-
-async def language(update: Update, context: CallbackContext) -> int:
-    user_id = update.message.from_user.id
-    
-    if user_id in banned_users:
-        await update.message.reply_text("You are banned from using this bot.")
-        return ConversationHandler.END
-
-    # Save the language preference
-    lang = update.message.text.lower()
-    if lang == '1' or lang == 'english':
-        user_data[user_id]['language'] = 'en'
-    elif lang == '2' or lang == 'russian':
-        user_data[user_id]['language'] = 'ru'
-    elif lang == '3' or lang == 'indonesian':
-        user_data[user_id]['language'] = 'id'
-    else:
-        await update.message.reply_text("Invalid language option. Please select '1' for English, '2' for Russian, or '3' for Indonesian.")
-        return LANGUAGE
-
-    await update.message.reply_text("You are all set! Looking for a match...")
-
-    # Match the user with someone of the opposite gender
-    return await match_user(update, context)
-
-async def match_user(update: Update, context: CallbackContext) -> int:
-    user_id = update.message.from_user.id
-    if user_id in banned_users:
-        await update.message.reply_text("You are banned from using this bot.")
-        return ConversationHandler.END
-
-    user_gender = user_data[user_id].get('gender')
-    user_lang = user_data[user_id].get('language')
-    
-    # Find users of the opposite gender
-    available_users = [
-        user for user, data in user_data.items() 
-        if data['gender'] != user_gender and data['language'] == user_lang and user != user_id
-    ]
-
-    if not available_users:
-        await update.message.reply_text("Sorry, no matches available right now. Please try again later.")
-        return ConversationHandler.END
-    
-    # Randomly match with someone
-    matched_user = random.choice(available_users)
-    matched_user_name = f"User {matched_user}"
-    
-    await update.message.reply_text(f"Congratulations! You have been matched with {matched_user_name}.")
+    context.user_data["gender"] = gender
+    update.message.reply_text("✅ Gender saved. Use /find to start chatting.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 
-# Admin panel commands
-async def admin_panel(update: Update, context: CallbackContext):
-    user_id = update.message.from_user.id
-    if user_id != ADMIN_ID:
-        await update.message.reply_text("You are not authorized to access the admin panel.")
+def find(update: Update, context: CallbackContext):
+    user_id = update.message.chat_id
+    gender = context.user_data.get("gender", None)
+
+    if user_id in active_chats:
+        update.message.reply_text("⚠ You are already in a chat!")
         return
 
-    await update.message.reply_text("Admin Panel:\n\n"
-                                    "/ban <user_id> - Ban a user\n"
-                                    "/unban <user_id> - Unban a user\n"
-                                    "/list_users - List all users\n"
-                                    "/send_notice <message> - Send a notice to all users")
-
-async def ban_user(update: Update, context: CallbackContext):
-    if len(context.args) == 0:
-        await update.message.reply_text("Please provide the user_id to ban.")
-        return
-
-    user_id = int(context.args[0])
+    other_gender = "female" if gender == "male" else "male"
     
-    if user_id in banned_users:
-        await update.message.reply_text("This user is already banned.")
+    if queue[other_gender]:
+        partner_id = queue[other_gender].pop(0)
+    elif queue[gender]:
+        partner_id = queue[gender].pop(0)
+    else:
+        queue[gender].append(user_id)
+        update.message.reply_text("⏳ Searching for a partner...")
         return
 
-    banned_users.add(user_id)
-    await update.message.reply_text(f"User {user_id} has been banned.")
+    active_chats[user_id] = partner_id
+    active_chats[partner_id] = user_id
 
-async def unban_user(update: Update, context: CallbackContext):
-    if len(context.args) == 0:
-        await update.message.reply_text("Please provide the user_id to unban.")
+    context.bot.send_message(chat_id=user_id, text="🎉 Connected! Say hi!")
+    context.bot.send_message(chat_id=partner_id, text="🎉 Connected! Say hi!")
+
+def message_handler(update: Update, context: CallbackContext):
+    user_id = update.message.chat_id
+    if user_id not in active_chats:
+        update.message.reply_text("⚠ You're not in a chat. Use /find to start.")
         return
 
-    user_id = int(context.args[0])
-    
-    if user_id not in banned_users:
-        await update.message.reply_text("This user is not banned.")
+    partner_id = active_chats[user_id]
+    now = time.time()
+    if user_id in last_messages and now - last_messages[user_id] < 1.5:
+        update.message.reply_text("⚠ Slow down! Wait before sending again.")
+        return
+    last_messages[user_id] = now
+
+    context.bot.send_message(chat_id=partner_id, text=update.message.text)
+
+def end(update: Update, context: CallbackContext):
+    user_id = update.message.chat_id
+    if user_id not in active_chats:
+        update.message.reply_text("⚠ You are not in a chat.")
         return
 
-    banned_users.remove(user_id)
-    await update.message.reply_text(f"User {user_id} has been unbanned.")
+    partner_id = active_chats.pop(user_id)
+    active_chats.pop(partner_id, None)
 
-async def list_users(update: Update, context: CallbackContext):
-    users_list = "\n".join([str(user) for user in user_data.keys()])
-    await update.message.reply_text(f"List of users:\n\n{users_list}")
+    context.bot.send_message(chat_id=partner_id, text="🔴 Chat ended.")
+    update.message.reply_text("🔴 Chat ended.")
 
-async def send_notice(update: Update, context: CallbackContext):
-    if len(context.args) == 0:
-        await update.message.reply_text("Please provide the message to send.")
+def ban(update: Update, context: CallbackContext):
+    if update.message.chat_id != ADMIN_ID:
+        update.message.reply_text("🚫 Only the bot owner can ban users.")
         return
 
-    message = ' '.join(context.args)
-    for user_id in user_data.keys():
-        try:
-            await context.bot.send_message(user_id, message)
-        except:
-            continue
-    await update.message.reply_text("Notice sent to all users.")
+    try:
+        user_id = int(context.args[0])
+        banned_users.add(user_id)
+        update.message.reply_text(f"✅ User {user_id} has been banned.")
+    except:
+        update.message.reply_text("❌ Usage: /ban <user_id>")
+
+def unban(update: Update, context: CallbackContext):
+    if update.message.chat_id != ADMIN_ID:
+        update.message.reply_text("🚫 Only the bot owner can unban users.")
+        return
+
+    try:
+        user_id = int(context.args[0])
+        banned_users.discard(user_id)
+        update.message.reply_text(f"✅ User {user_id} has been unbanned.")
+    except:
+        update.message.reply_text("❌ Usage: /unban <user_id>")
 
 def main():
-    # Set up persistence
-    persistence = PicklePersistence("bot_data")
+    updater = Updater(TOKEN, use_context=True)
+    dp = updater.dispatcher
 
-    # Create the application and add handlers
-    application = Application.builder().token('YOUR_BOT_API_KEY').persistence(persistence).build()
-
-    # Add conversation handlers
-    conversation_handler = ConversationHandler(
+    conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
-        states={
-            GENDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, gender)],
-            LANGUAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, language)],
-            MATCHING: [MessageHandler(filters.TEXT & ~filters.COMMAND, match_user)]
-        },
+        states={GENDER: [MessageHandler(Filters.text & ~Filters.command, select_gender)]},
         fallbacks=[]
     )
 
-    # Add admin commands
-    application.add_handler(CommandHandler("admin", admin_panel))
-    application.add_handler(CommandHandler("ban", ban_user))
-    application.add_handler(CommandHandler("unban", unban_user))
-    application.add_handler(CommandHandler("list_users", list_users))
-    application.add_handler(CommandHandler("send_notice", send_notice))
+    dp.add_handler(conv_handler)
+    dp.add_handler(CommandHandler("find", find))
+    dp.add_handler(CommandHandler("end", end))
+    dp.add_handler(CommandHandler("ban", ban, pass_args=True))
+    dp.add_handler(CommandHandler("unban", unban, pass_args=True))
+    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, message_handler))
 
-    # Add conversation handler to the application
-    application.add_handler(conversation_handler)
-
-    # Start polling
-    application.run_polling()
+    updater.start_polling()
+    updater.idle()
 
 if __name__ == "__main__":
     main()
+        
